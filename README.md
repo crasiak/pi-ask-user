@@ -151,6 +151,110 @@ interface AskToolDetails {
 }
 ```
 
+## Cooperative deferral (unpublished local patch)
+
+Ordinary asking, answering, and human cancellation remain available on existing hosts.
+AFK deferral requires **native `ctx.mode === "tui"` and the matching
+`ctx.ui.targetedDialogCancellation` capability**. Stock Pi 0.87.1 does not
+provide that guarantee. The companion classic-core patch qualifies `input`,
+`select`, and `custom-overlay`; it does **not** qualify `custom-inline`.
+RPC, print/headless, missing markers, and unqualified layouts refuse deferral
+without dismissing the question. There is no weaker cancellation fallback.
+The package version and dependency pins are unchanged; this is not a release.
+
+### Trusted in-process API, version 1
+
+This API is an extension event-bus protocol, not a model-callable tool. Subscribe
+to `ask:defer:v1:reply` before emitting on `ask:defer:v1:request`:
+
+```typescript
+pi.events.emit("ask:defer:v1:request", {
+  version: 1, requestId: "discover-1", method: "capabilities",
+});
+// The capabilities reply contains pending [{toolCallId, interactionId, kind,
+// supported, uiPromptAttribution, owner, state}], at most 32 entries,
+// and a truncated boolean. No question text.
+// After independently checking ownership/authority, target those exact IDs:
+pi.events.emit("ask:defer:v1:request", {
+  version: 1, requestId: "defer-1", method: "defer",
+  toolCallId, interactionId, reason: "deferred_by_afk",
+});
+```
+
+`requestId`, `toolCallId`, and `interactionId` must be nonempty strings of at most
+256 characters. Each execution gets a fresh interaction UUID, even if a tool-call
+ID is reused. Reply statuses are `capabilities`, `accepted`, `unsupported_ui`,
+`not_pending`, `already_settled`, `already_requested`, `invalid_request`, or
+`cleanup_failed`. Unusable request IDs are ignored. Replies echo version,
+request ID, method, and (for validated defer requests) interaction IDs. Recent
+request IDs and settled IDs are bounded to 256 entries; after eviction a stale
+interaction remains harmless and is reported as `not_pending`.
+
+`ask:defer:v1:opened` and `ask:defer:v1:closed` carry version, IDs, kind, supported,
+uiPromptAttribution, owner, and state. Opened is emitted only after cancellation is wired. Pending discovery
+reports the **current** kind, including fallback/comment dialog transitions;
+opened is a once-per-interaction observation, not a promise that the kind cannot
+change. Subscribe to observations and query capabilities for late discovery.
+
+### UI completion attribution (D009 prerequisite)
+
+Every UI call for an interaction (custom overlay/inline, freeform, fallback
+selection, multi-selection, and optional comment) receives the frozen internal
+`owner: { namespace: "pi-ask-user", id: interactionId }`. The registry creates a
+fresh UUID per execution/reload and binds it to the actual `toolCallId`. Tool
+parameters cannot select this token. Ownership is correlation, not authorization.
+
+Pending/capabilities and opened/closed metadata report `uiPromptAttribution: true`
+only for native TUI with the runner-provided
+`ctx.ui.uiPromptOwnership === "exclusive-v1"` marker. A version string or
+`targetedDialogCancellation` alone is insufficient. `supported` still means
+component-only targeted deferral, independently of attribution. Thus an older
+cancellation-qualified core can accept deferral with `uiPromptAttribution: false`;
+a controller must refuse automatic continuation on that basis. Conversely,
+inline may report attribution while `supported: false`; its cancellation remains
+unqualified. RPC/headless remain unsupported, and missing/unknown attribution
+markers are never advertised as support.
+
+The core accepts nonempty namespace/ID strings of at most 256 UTF-16 code units,
+copies them, and ignores malformed metadata without preventing UI. Its existing
+outer-depth `ui_prompt_start/end` events are not suppressed. Start records only
+the initial owner. End retains it only if every nested/overlapping prompt had the
+same valid owner. Any unowned, invalid, or different owner clears end attribution
+for the entire interval, regardless of completion order. A later same-owner prompt
+cannot restore it before depth reaches zero. `uiPromptAttribution` advertises that
+contract, not a promise that a particular end will be owned.
+
+Unattributed/mixed ends must conservatively pause downstream even during an
+outstanding defer request or after a late acceptance. An owned end alone does
+not authorize continuation: future AoE integration still requires a live grant,
+host-admitted exact IDs, an exclusively matching end, and a bounded exact
+accepted cleanup reply. Human input, cancellation, timeouts, contradictory or
+lost replies must retain precedence. This patch does not implement AoE
+continuation, request reservations, or new permission.
+
+### Outcome ordering
+
+The first committed complete outcome wins. Deferral commitment is queued behind
+already-enqueued UI answer-promise continuations; partial choices/comment drafts
+are not complete answers. An `accepted` reply follows settlement of the owned UI
+promise and cleanup, not just receipt of the request. Custom UI closes through
+its owner's completion callback (including hidden overlays); built-in dialogs
+use a dedicated per-execution signal. No answer is selected or typed, no terminal
+keys are simulated, and the agent turn is not aborted.
+
+A deferred result has `status: "no_human_answer"`, `reason: "deferred_by_afk"`,
+`response: null`, `cancelled: true`, and both IDs. It renders as **Deferred (AFK)**,
+not legacy Cancelled. The additive `ask:deferred` event includes question,
+context, options, reason, and IDs; it never emits `ask:answered` or `ask:cancelled`.
+Ordinary events retain their payloads with additive IDs. Deferral is not human
+approval and supplies no permission, policy, or request budget.
+
+Listeners and per-call timers are cleaned up on completion and session shutdown
+(including reload/replacement); no processes or timers start in the extension
+factory. Consumers should unsubscribe their reply listeners and apply a bounded
+local deadline when waiting for responses. See `tests/README.md` for local,
+offline verification and the terminal fixture.
+
 ## Changelog
 
 See [CHANGELOG.md](./CHANGELOG.md).

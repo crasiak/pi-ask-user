@@ -1,8 +1,14 @@
-import { beforeAll, describe, expect, mock, onTestFinished, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+
+const cleanups: Array<() => void> = [];
+afterEach(() => { while (cleanups.length) cleanups.pop()!(); });
 
 let editorInputs: string[] = [];
 let editorText = "";
 let emittedEvents: Array<{ name: string; payload: any }> = [];
+let eventBus: { emit(name: string, payload: any): void; on(name: string, handler: (data: any) => void): () => void; listenerCount(name?: string): number };
+let start: () => void | Promise<void>;
+let shutdown: () => Promise<void>;
 
 function wrapPlainText(text: string, width = 80): string[] {
    const lines: string[] = [];
@@ -201,7 +207,7 @@ type RegisteredTool = {
 function stubEnv(key: string, value: string): void {
    const original = process.env[key];
    process.env[key] = value;
-   onTestFinished(() => {
+   cleanups.push(() => {
       if (original === undefined) {
          delete process.env[key];
       } else {
@@ -214,15 +220,34 @@ async function setupTool(): Promise<RegisteredTool> {
    const { default: askUserExtension } = await import("./index");
    let registeredTool: RegisteredTool | undefined;
    emittedEvents = [];
+   const handlers = new Map<string, Set<(data: any) => void>>();
+   eventBus = {
+      emit(name: string, payload: any) {
+         emittedEvents.push({ name, payload });
+         for (const handler of handlers.get(name) ?? []) handler(payload);
+      },
+      on(name: string, handler: (data: any) => void) {
+         if (!handlers.has(name)) handlers.set(name, new Set());
+         handlers.get(name)!.add(handler);
+         return () => handlers.get(name)!.delete(handler);
+      },
+      listenerCount(name?: string) {
+         return name === undefined
+            ? [...handlers.values()].reduce((count, listeners) => count + listeners.size, 0)
+            : handlers.get(name)?.size ?? 0;
+      },
+   };
+   start = () => { throw new Error("session_start hook was not registered"); };
+   shutdown = () => Promise.resolve();
    const pi = {
+      on(name: string, handler: () => Promise<void>) {
+         if (name === "session_start") start = handler;
+         if (name === "session_shutdown") shutdown = handler;
+      },
       registerTool(tool: RegisteredTool) {
          registeredTool = tool;
       },
-      events: {
-         emit(name: string, payload: any) {
-            emittedEvents.push({ name, payload });
-         },
-      },
+      events: eventBus,
    } as any;
 
    askUserExtension(pi);
@@ -298,7 +323,8 @@ describe("ask_user", () => {
          },
       );
 
-      expect(capturedOptions).toBeUndefined();
+      expect(capturedOptions.overlay).toBeUndefined();
+      expect(capturedOptions.owner.namespace).toBe("pi-ask-user");
       expect(result.details.cancelled).toBe(true);
    });
 
@@ -392,7 +418,8 @@ describe("ask_user", () => {
          },
       );
 
-      expect(capturedOptions).toBeUndefined();
+      expect(capturedOptions.overlay).toBeUndefined();
+      expect(capturedOptions.owner.namespace).toBe("pi-ask-user");
    });
 
    test("call-level displayMode overrides PI_ASK_USER_DISPLAY_MODE env var", async () => {
@@ -2409,7 +2436,408 @@ describe("ask_user", () => {
             },
          );
 
-         expect(capturedOpts).toEqual({ timeout: 5000 });
+         expect(capturedOpts.timeout).toBe(5000);
+         expect(capturedOpts.signal).toBeInstanceOf(AbortSignal);
       });
    });
+});
+// CRA-860: the mock owner actually closes its UI on done/signal; replies cannot precede cleanup.
+describe("cooperative AFK deferral v1", () => {
+   const requestChannel = "ask:defer:v1:request";
+   const replyChannel = "ask:defer:v1:reply";
+   let requestCounter = 0;
+   function request(body: any): Promise<any> {
+      const requestId = body.requestId ?? `r-${++requestCounter}`;
+      return new Promise((resolve) => {
+         const off = eventBus.on(replyChannel, (reply) => {
+            if (reply.requestId === requestId) { off(); resolve(reply); }
+         });
+         eventBus.emit(requestChannel, { version: 1, requestId, ...body });
+      });
+   }
+   function metadata() {
+      return emittedEvents.find((e) => e.name === "ask:defer:v1:opened")!.payload;
+   }
+   function defer(ids = metadata()) { return request({ method: "defer", ...ids, reason: "deferred_by_afk" }); }
+   function customOwner(mode = "tui", kinds: string[] = ["input", "select", "custom-overlay"]) {
+      let component: any, finish!: (v: any) => void, release!: () => void;
+      let held = false, removed = false, listenerCount = 0, hidden = false;
+      let terminalInput: ((data: string) => any) | undefined;
+      const owners: Array<{ namespace: string; id: string }> = [];
+      const ctx = { hasUI: true, mode, ui: {
+         targetedDialogCancellation: kinds,
+         uiPromptOwnership: "exclusive-v1" as string | undefined,
+         custom(factory: any, options: any) {
+            owners.push(options.owner);
+            return new Promise((resolve) => {
+               finish = (value) => { removed = true; release = () => resolve(value); if (!held) release(); };
+               component = factory({ requestRender() {}, terminal: { rows: 24 } }, createTheme(), createKeybindings(), finish);
+               options?.onHandle?.({
+                  hide() { throw new Error("package must not call handle.hide"); },
+                  setHidden(v: boolean) { hidden = v; }, isHidden() { return hidden; },
+               });
+            });
+         },
+         onTerminalInput(handler: (data: string) => any) { listenerCount++; terminalInput = handler; return () => { listenerCount--; }; },
+         notify() {},
+      } };
+      return { ctx, owners, key: (key: string) => component.handleInput(key), hide: () => terminalInput?.("alt+o"),
+         get hidden() { return hidden; }, get removed() { return removed; }, get listeners() { return listenerCount; },
+         hold() { held = true; }, release: () => release(), finish: (v: any) => finish(v) };
+   }
+   function dialogOwner(fallback = false, mode = "tui", kinds = ["input", "select"]) {
+      let answer!: (v?: string) => void;
+      let active = 0, aborts = 0;
+      const open = (_title: string, _placeholder: unknown, opts: any) => new Promise<string | undefined>((resolve) => {
+         if (opts.signal.aborted) { resolve(undefined); return; }
+         active++;
+         let closed = false;
+         const onAbort = () => { aborts++; answer(undefined); };
+         answer = (value) => { if (closed) return; closed = true; active--; opts.signal.removeEventListener("abort", onAbort); resolve(value); };
+         opts.signal.addEventListener("abort", onAbort);
+      });
+      return { ctx: { mode, hasUI: true, ui: { targetedDialogCancellation: kinds, input: open, select: open, custom: fallback ? async () => undefined : undefined } },
+         answer: (v?: string) => answer(v), get active() { return active; }, get aborts() { return aborts; } };
+   }
+   const params = { question: "Q", options: ["A", "B"] };
+   for (const variant of ["options", "multiselect", "comment-draft", "freeform-draft", "hidden"] as const) {
+      test(`defers ${variant} without attributing a human answer or cancellation`, async () => {
+         const tool = await setupTool(), owner = customOwner();
+         const resultPromise = tool.execute("call", { ...params, allowMultiple: variant === "multiselect", allowComment: variant === "comment-draft" }, undefined, undefined, owner.ctx);
+         if (variant === "multiselect") owner.key("space");
+         if (variant === "comment-draft") { owner.key("ctrl+g"); owner.key("enter"); editorText = "partial comment"; }
+         if (variant === "freeform-draft") { owner.key("down"); owner.key("down"); owner.key("enter"); editorText = "partial answer"; }
+         if (variant === "hidden") { owner.hide(); expect(owner.hidden).toBe(true); }
+         const reply = await defer();
+         expect(reply.status).toBe("accepted");
+         expect(owner.removed).toBe(true); expect(owner.listeners).toBe(0);
+         const result = await resultPromise;
+         expect(result.details).toMatchObject({ toolCallId: "call", status: "no_human_answer", reason: "deferred_by_afk", response: null, cancelled: true });
+         expect(result.content[0].text).toBe("No completed human answer was submitted; the question was deferred because AFK is active.");
+         expect(tool.renderResult(result, {}, createTheme()).render().join(" ")).toContain("Deferred (AFK)");
+         expect(emittedEvents.filter((e) => e.name === "ask:answered" || e.name === "ask:cancelled")).toHaveLength(0);
+         expect(emittedEvents.filter((e) => e.name === "ask:deferred")).toHaveLength(1);
+         expect(emittedEvents.filter((e) => e.name === "ask:defer:v1:closed")).toHaveLength(1);
+         owner.key("enter"); // Old callbacks cannot produce new outcomes.
+         expect((await defer()).status).toBe("already_settled");
+      });
+   }
+   test("acknowledges only after the owner's promise and terminal cleanup settle", async () => {
+      const tool = await setupTool(), owner = customOwner(); owner.hold();
+      const p = tool.execute("call", params, undefined, undefined, owner.ctx);
+      let replied = false;
+      const reply = defer().then((r) => { replied = true; return r; });
+      await Promise.resolve(); await Promise.resolve();
+      expect(owner.removed).toBe(true); expect(replied).toBe(false); expect(owner.listeners).toBe(1);
+      owner.release(); expect((await reply).status).toBe("accepted"); await p;
+      expect(owner.listeners).toBe(0);
+   });
+   for (const first of ["answer", "defer"] as const) {
+      test(`freeform same JS turn: ${first} queued first wins`, async () => {
+         const tool = await setupTool(), owner = dialogOwner();
+         const p = tool.execute("call", { question: "Q" }, undefined, undefined, owner.ctx);
+         let reply: Promise<any>;
+         if (first === "answer") { owner.answer("human"); reply = defer(); }
+         else { reply = defer(); owner.answer("too late"); }
+         const result = await p;
+         expect(result.details.response).toEqual(first === "answer" ? { kind: "freeform", text: "human" } : null);
+         expect((await reply).status).toBe(first === "answer" ? "already_settled" : "accepted");
+         expect(owner.active).toBe(0);
+      });
+      test(`custom ${first} commitment wins`, async () => {
+         const tool = await setupTool(), owner = customOwner();
+         const p = tool.execute("call", params, undefined, undefined, owner.ctx);
+         if (first === "answer") owner.key("enter");
+         const reply = defer();
+         if (first === "defer") { await Promise.resolve(); owner.key("enter"); }
+         const result = await p;
+         expect(result.details.cancelled).toBe(first !== "answer");
+         expect((await reply).status).toBe(first === "answer" ? "already_settled" : "accepted");
+      });
+   }
+   test("late capabilities discovery, exact identity, malformed and repeated requests", async () => {
+      const tool = await setupTool(), owner = customOwner();
+      const p = tool.execute("reused", params, undefined, undefined, owner.ctx);
+      const caps = await request({ method: "capabilities" });
+      const ids = caps.pending[0];
+      expect(ids.supported).toBe(true); expect(ids.toolCallId).toBe("reused"); expect(ids.question).toBeUndefined();
+      expect((await request({ method: "defer", ...ids, toolCallId: "other", reason: "deferred_by_afk" })).status).toBe("not_pending");
+      expect((await request({ method: "defer", ...ids, reason: "approve" })).status).toBe("invalid_request");
+      expect(owner.removed).toBe(false);
+      const body = { method: "defer", ...ids, requestId: "duplicate", reason: "deferred_by_afk" };
+      expect((await request(body)).status).toBe("accepted"); await p;
+      expect((await request(body)).status).toBe("already_requested");
+      const next = customOwner();
+      const p2 = tool.execute("reused", params, undefined, undefined, next.ctx);
+      expect((await request({ method: "defer", ...ids, reason: "deferred_by_afk" })).status).toBe("already_settled");
+      expect(next.removed).toBe(false);
+      next.key("escape"); await p2;
+      expect((await request({ method: "capabilities" })).pending).toEqual([]);
+   });
+   for (const variant of ["inline", "missing-marker", "rpc"] as const) {
+      test(`refuses ${variant} and leaves ordinary answering alone`, async () => {
+         const tool = await setupTool(), owner = customOwner(variant === "rpc" ? "rpc" : "tui", variant === "missing-marker" ? [] : undefined);
+         const p = tool.execute("call", { ...params, displayMode: variant === "inline" ? "inline" : "overlay" }, undefined, undefined, owner.ctx);
+         expect((await defer()).status).toBe("unsupported_ui"); expect(owner.removed).toBe(false);
+         owner.key("enter"); expect((await p).details.cancelled).toBe(false);
+      });
+   }
+   for (const allowMultiple of [true, false]) {
+      test(`qualified fallback ${allowMultiple ? "input" : "select"} can defer`, async () => {
+         const tool = await setupTool(), owner = dialogOwner(true);
+         const p = tool.execute("call", { ...params, allowMultiple }, undefined, undefined, owner.ctx);
+         await Promise.resolve(); // custom() has reported unsupported; fallback is now wired.
+         expect((await defer()).status).toBe("accepted");
+         expect((await p).details.reason).toBe("deferred_by_afk"); expect(owner.active).toBe(0);
+      });
+   }
+   test("fallback selection is only a draft while the comment is pending", async () => {
+      const tool = await setupTool(), owner = dialogOwner(true);
+      const p = tool.execute("call", { ...params, allowComment: true }, undefined, undefined, owner.ctx);
+      await Promise.resolve(); owner.answer("A"); await Promise.resolve();
+      expect((await defer()).status).toBe("accepted"); expect((await p).details.response).toBeNull();
+   });
+   test("tool abort first refuses AFK; AFK first ignores later abort", async () => {
+      for (const first of ["abort", "defer"]) {
+         const tool = await setupTool(), owner = customOwner(), controller = new AbortController();
+         const p = tool.execute("call", params, controller.signal, undefined, owner.ctx);
+         if (first === "abort") controller.abort();
+         const reply = defer(); await Promise.resolve();
+         if (first === "defer") controller.abort();
+         expect((await reply).status).toBe(first === "abort" ? "already_settled" : "accepted");
+         expect((await p).details.reason).toBe(first === "defer" ? "deferred_by_afk" : undefined);
+      }
+   });
+   test("already-aborted execution never opens or advertises a dialog", async () => {
+      const tool = await setupTool(), owner = customOwner(), c = new AbortController(); c.abort();
+      await tool.execute("call", params, c.signal, undefined, owner.ctx);
+      expect(emittedEvents).toHaveLength(0); expect(owner.listeners).toBe(0);
+   });
+   test("shutdown closes active UI and unsubscribes protocol listeners", async () => {
+      const tool = await setupTool(), owner = customOwner();
+      const p = tool.execute("call", params, undefined, undefined, owner.ctx);
+      await shutdown(); await p;
+      expect(owner.removed).toBe(true); expect(owner.listeners).toBe(0);
+      emittedEvents = [];
+      eventBus.emit(requestChannel, { version: 1, requestId: "after-shutdown", method: "capabilities" });
+      expect(emittedEvents.filter((e) => e.name === replyChannel)).toHaveLength(0);
+   });
+   for (const outcome of ["answer", "defer"] as const) {
+      test(`shutdown/start rebinds once and isolates reused toolCallId through ${outcome}`, async () => {
+         const realSet = globalThis.setTimeout, realClear = globalThis.clearTimeout;
+         const timers = new Map<number, () => void>(); let counter = 0;
+         globalThis.setTimeout = ((fn: () => void) => { timers.set(++counter, fn); return counter; }) as any;
+         globalThis.clearTimeout = ((id: number) => { timers.delete(id); }) as any;
+         cleanups.push(() => { globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear; });
+         function trackedAbort() {
+            const controller = new AbortController();
+            const listeners = new Set<() => void>();
+            const add = controller.signal.addEventListener.bind(controller.signal);
+            const remove = controller.signal.removeEventListener.bind(controller.signal);
+            controller.signal.addEventListener = ((type: string, listener: () => void, options: any) => {
+               if (type === "abort") listeners.add(listener);
+               add(type, listener, options);
+            }) as any;
+            controller.signal.removeEventListener = ((type: string, listener: () => void, options: any) => {
+               if (type === "abort") listeners.delete(listener);
+               remove(type, listener, options);
+            }) as any;
+            return { controller, listeners };
+         }
+         const tool = await setupTool(), oldOwner = customOwner(), oldAbort = trackedAbort();
+         oldOwner.hold();
+         const results: any[] = [];
+         const previous = tool.execute("reused", { ...params, timeout: 5000 }, oldAbort.controller.signal, undefined, oldOwner.ctx)
+            .then((result) => { results.push(result); return result; });
+         const oldIds = (await request({ method: "capabilities" })).pending[0];
+         const lateTimeout = [...timers.values()][0]!;
+         const lateAbort = [...oldAbort.listeners][0]!;
+         expect(timers.size).toBe(1); expect(oldAbort.listeners.size).toBe(1);
+         expect(eventBus.listenerCount(requestChannel)).toBe(1);
+
+         let stopped = false;
+         const stopping = shutdown().then(() => { stopped = true; });
+         expect(eventBus.listenerCount()).toBe(0);
+         eventBus.emit(requestChannel, { version: 1, requestId: "while-stopped", method: "capabilities" });
+         expect(emittedEvents.filter((e) => e.name === replyChannel && e.payload.requestId === "while-stopped")).toHaveLength(0);
+         await Promise.resolve();
+         expect(stopped).toBe(false); expect(oldOwner.removed).toBe(true);
+         oldOwner.release();
+         await stopping;
+         expect((await previous).details).toMatchObject({ interactionId: oldIds.interactionId, response: null, cancelled: true });
+         expect(timers.size).toBe(0); expect(oldAbort.listeners.size).toBe(0); expect(oldOwner.listeners).toBe(0);
+
+         // Exercise the real factory's session_start handler, including duplicate delivery.
+         await start(); await start();
+         expect(eventBus.listenerCount()).toBe(1);
+         const empty = await request({ method: "capabilities", requestId: "after-rebind" });
+         expect(empty.pending).toEqual([]);
+         expect(emittedEvents.filter((e) => e.name === replyChannel && e.payload.requestId === "after-rebind")).toHaveLength(1);
+         const nextOwner = customOwner(), nextAbort = trackedAbort();
+         const next = tool.execute("reused", { ...params, timeout: 5000 }, nextAbort.controller.signal, undefined, nextOwner.ctx)
+            .then((result) => { results.push(result); return result; });
+         const nextIds = (await request({ method: "capabilities" })).pending[0];
+         expect(nextIds.toolCallId).toBe(oldIds.toolCallId);
+         expect(nextIds.interactionId).not.toBe(oldIds.interactionId);
+         expect(oldOwner.owners).toEqual([{ namespace: "pi-ask-user", id: oldIds.interactionId }]);
+         expect(nextOwner.owners).toEqual([{ namespace: "pi-ask-user", id: nextIds.interactionId }]);
+         expect(nextIds.uiPromptAttribution).toBe(true);
+         expect(nextIds.state).toBe("pending"); expect(nextIds.supported).toBe(true);
+         expect((await defer(oldIds)).status).toBe("not_pending");
+
+         // Retained UI callbacks and already-queued timer/abort work belong only to the old call.
+         oldOwner.key("enter"); oldOwner.finish({ kind: "selection", selections: ["B"] });
+         lateTimeout(); lateAbort(); oldAbort.controller.abort();
+         await Promise.resolve();
+         expect(nextOwner.removed).toBe(false); expect(nextOwner.listeners).toBe(1);
+         expect(timers.size).toBe(1); expect(nextAbort.listeners.size).toBe(1);
+         expect((await request({ method: "capabilities" })).pending).toEqual([nextIds]);
+         expect(results).toHaveLength(1);
+         expect(emittedEvents.filter((e) => e.name === "ask:answered" || e.name === "ask:deferred")).toHaveLength(0);
+
+         if (outcome === "answer") nextOwner.key("enter");
+         else expect((await defer(nextIds)).status).toBe("accepted");
+         const result = await next;
+         expect(result.details.interactionId).toBe(nextIds.interactionId);
+         expect(result.details.response).toEqual(outcome === "answer" ? { kind: "selection", selections: ["A"] } : null);
+         expect(result.details.reason).toBe(outcome === "defer" ? "deferred_by_afk" : undefined);
+         nextOwner.key("enter"); oldOwner.key("enter"); lateTimeout(); lateAbort();
+         expect((await defer(nextIds)).status).toBe("already_settled");
+         expect(results).toHaveLength(2);
+         expect(emittedEvents.filter((e) => e.name === "ask:answered")).toHaveLength(outcome === "answer" ? 1 : 0);
+         expect(emittedEvents.filter((e) => e.name === "ask:deferred")).toHaveLength(outcome === "defer" ? 1 : 0);
+         expect(emittedEvents.filter((e) => e.name === "ask:cancelled")).toHaveLength(1);
+         expect(emittedEvents.filter((e) => e.name === "ask:defer:v1:closed").map((e) => e.payload.interactionId))
+            .toEqual([oldIds.interactionId, nextIds.interactionId]);
+         expect((await request({ method: "capabilities" })).pending).toEqual([]);
+         expect(timers.size).toBe(0); expect(nextAbort.listeners.size).toBe(0); expect(nextOwner.listeners).toBe(0);
+         expect(eventBus.listenerCount()).toBe(1); // Only the rebound request listener remains.
+         await shutdown(); await shutdown();
+         expect(eventBus.listenerCount()).toBe(0);
+      });
+   }
+   test("timeout/AFK ordering and all custom exits clear timers and abort listeners", async () => {
+      const realSet = globalThis.setTimeout, realClear = globalThis.clearTimeout;
+      const timers = new Map<number, () => void>(); let counter = 0;
+      globalThis.setTimeout = ((fn: () => void) => { timers.set(++counter, fn); return counter; }) as any;
+      globalThis.clearTimeout = ((id: number) => { timers.delete(id); }) as any;
+      cleanups.push(() => { globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear; });
+      for (const exit of ["answer", "cancel", "timeout", "defer", "shutdown", "error"]) {
+         const tool = await setupTool(), owner = customOwner(), c = new AbortController();
+         let listeners = 0;
+         const add = c.signal.addEventListener.bind(c.signal), remove = c.signal.removeEventListener.bind(c.signal);
+         c.signal.addEventListener = ((...args: any[]) => { listeners++; add(...args as [any, any, any]); }) as any;
+         c.signal.removeEventListener = ((...args: any[]) => { listeners--; remove(...args as [any, any, any]); }) as any;
+         if (exit === "error") owner.ctx.ui.custom = () => { throw new Error("UI failed"); };
+         const p = tool.execute("call", { ...params, timeout: 5000 }, c.signal, undefined, owner.ctx);
+         let reply: Promise<any> | undefined;
+         if (exit === "answer") owner.key("enter");
+         if (exit === "cancel") owner.key("escape");
+         if (exit === "timeout") { [...timers.values()][0]!(); reply = defer(); }
+         if (exit === "defer") { reply = defer(); await Promise.resolve(); [...timers.values()][0]?.(); }
+         if (exit === "shutdown") await shutdown();
+         const result = await p;
+         if (reply) expect((await reply).status).toBe(exit === "defer" ? "accepted" : "already_settled");
+         expect(timers.size).toBe(0); expect(listeners).toBe(0); expect(owner.listeners).toBe(0);
+         expect(result.details.reason).toBe(exit === "defer" ? "deferred_by_afk" : undefined);
+      }
+   });
+   test("RPC fallback refusal does not abort the remote dialog promise", async () => {
+      const tool = await setupTool(), owner = dialogOwner(true, "rpc");
+      const p = tool.execute("call", params, undefined, undefined, owner.ctx);
+      await Promise.resolve();
+      expect((await defer()).status).toBe("unsupported_ui");
+      expect(owner.active).toBe(1); expect(owner.aborts).toBe(0);
+      owner.answer("B"); expect((await p).details.response.selections).toEqual(["B"]);
+   });
+   test("fallback final select promise resolution wins over same-turn AFK", async () => {
+      const tool = await setupTool(), owner = dialogOwner(true);
+      const p = tool.execute("call", params, undefined, undefined, owner.ctx);
+      await Promise.resolve(); owner.answer("B"); const reply = defer();
+      expect((await reply).status).toBe("already_settled");
+      expect((await p).details.response.selections).toEqual(["B"]);
+   });
+   test("headless has no pending interaction and no fabricated response", async () => {
+      const tool = await setupTool();
+      const result = await tool.execute("call", params, undefined, undefined, { mode: "print", hasUI: false });
+      expect(result.isError).toBe(true); expect(result.details.response).toBeNull();
+      expect((await request({ method: "capabilities" })).pending).toEqual([]);
+   });
+
+   // CRA-860 / D009: tokens come only from the interaction registry, never tool parameters.
+   for (const variant of ["overlay", "inline"] as const) {
+      test(`internally owns ${variant} metadata and creates a fresh token for reused tool IDs`, async () => {
+         const tool = await setupTool();
+         const tokens: string[] = [];
+         for (let i = 0; i < 2; i++) {
+            const ui = customOwner();
+            const p = tool.execute("reused", { ...params, displayMode: variant,
+               owner: { namespace: "spoof", id: "spoof" }, interactionId: "spoof", uiPromptAttribution: true,
+            }, undefined, undefined, ui.ctx);
+            const pending = (await request({ method: "capabilities" })).pending[0];
+            expect(pending.uiPromptAttribution).toBe(true);
+            expect(pending.supported).toBe(variant === "overlay");
+            expect(pending.owner).toEqual({ namespace: "pi-ask-user", id: pending.interactionId });
+            expect(ui.owners).toEqual([pending.owner]);
+            expect(Object.isFrozen(ui.owners[0])).toBe(true);
+            expect(pending.interactionId).not.toBe("spoof");
+            tokens.push(pending.interactionId);
+            ui.key("enter");
+            expect((await p).details.interactionId).toBe(pending.interactionId);
+         }
+         expect(tokens[0]).not.toBe(tokens[1]);
+      });
+   }
+   for (const variant of ["freeform", "select", "sentinel", "single-comment", "multi", "multi-comment"] as const) {
+      test(`keeps the token across every ${variant} UI path`, async () => {
+         const tool = await setupTool();
+         const owners: Array<{ namespace: string; id: string }> = [];
+         const pending: Array<{ owner: unknown; uiPromptAttribution: boolean }> = [];
+         const inspect = (opts: { owner: { namespace: string; id: string } }) => {
+            owners.push(opts.owner);
+            eventBus.emit(requestChannel, { version: 1, requestId: `inspect-${owners.length}`, method: "capabilities" });
+            const reply = emittedEvents.filter((e) => e.name === replyChannel).slice(-1)[0].payload;
+            pending.push(...reply.pending);
+         };
+         const result = await tool.execute("real-call", { question: "Q",
+            ...(variant === "freeform" ? {} : { options: ["A", "B"] }),
+            allowMultiple: variant.startsWith("multi"), allowComment: variant.endsWith("comment"),
+            owner: { namespace: "spoof", id: "spoof" }, interactionId: "spoof",
+         }, undefined, undefined, { hasUI: true, mode: "tui", ui: {
+            uiPromptOwnership: "exclusive-v1", targetedDialogCancellation: ["input", "select"],
+            custom: async (_factory: unknown, opts: { owner: { namespace: string; id: string } }) => { inspect(opts); return undefined; },
+            select: async (_title: string, values: string[], opts: { owner: { namespace: string; id: string } }) => { inspect(opts); return variant === "sentinel" ? values[values.length - 1] : "A"; },
+            input: async (_title: string, _placeholder: string, opts: { owner: { namespace: string; id: string } }) => { inspect(opts); return "answer"; },
+         } });
+         expect(result.isError).not.toBe(true);
+         expect(owners.length).toBe(variant === "freeform" ? 1 : variant === "sentinel" || variant.endsWith("comment") ? 3 : 2);
+         expect(pending.length).toBeGreaterThan(0);
+         for (const value of owners) expect(value).toEqual({ namespace: "pi-ask-user", id: result.details.interactionId });
+         for (const value of pending) { expect(value.uiPromptAttribution).toBe(true); expect(value.owner).toEqual(owners[0]); }
+         expect(owners.every((value) => value === owners[0])).toBe(true);
+         expect(result.details.toolCallId).toBe("real-call");
+      });
+   }
+   for (const marker of [undefined, "unknown-v2", true, 1]) {
+      test(`does not infer attribution from cancellation alone (marker ${marker})`, async () => {
+         const tool = await setupTool(), ui = customOwner();
+         Object.assign(ui.ctx.ui, { uiPromptOwnership: marker });
+         const p = tool.execute("call", params, undefined, undefined, ui.ctx);
+         const pending = (await request({ method: "capabilities" })).pending[0];
+         expect(pending.supported).toBe(true);
+         expect(pending.uiPromptAttribution).toBe(false);
+         expect((await defer(pending)).status).toBe("accepted");
+         expect((await p).details.reason).toBe("deferred_by_afk");
+         expect(emittedEvents.some((e) => e.name === "ask:answered")).toBe(false);
+      });
+   }
+   test("RPC never advertises attribution even with a marker", async () => {
+      const tool = await setupTool(), ui = customOwner("rpc");
+      const p = tool.execute("call", params, undefined, undefined, ui.ctx);
+      const pending = (await request({ method: "capabilities" })).pending[0];
+      expect(pending.supported).toBe(false); expect(pending.uiPromptAttribution).toBe(false);
+      expect((await defer(pending)).status).toBe("unsupported_ui");
+      ui.key("enter"); await p;
+   });
+
 });

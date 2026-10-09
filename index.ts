@@ -32,6 +32,8 @@ import {
 } from "@earendil-works/pi-tui";
 import { renderSingleSelectRows, type QuestionOption } from "./single-select-layout";
 
+import { CooperativeDefer, DEFER_TEXT, type DialogKind } from "./cooperative-defer";
+
 import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 const ASK_USER_VERSION: string = (_require("./package.json") as { version: string }).version;
@@ -113,6 +115,10 @@ type AskResponse =
    };
 
 interface AskToolDetails {
+   toolCallId?: string;
+   interactionId?: string;
+   status?: "no_human_answer";
+   reason?: "deferred_by_afk";
    question: string;
    context?: string;
    options: QuestionOption[];
@@ -1749,6 +1755,8 @@ async function askViaDialogs(
    allowFreeform: boolean,
    allowComment: boolean,
    timeout?: number,
+   complete: (response: AskUIResult | null) => AskUIResult | null = (response) => response,
+   isPending: () => boolean = () => true,
 ): Promise<AskUIResult | null> {
    const dialogOpts = timeout ? { timeout } : undefined;
    const prompt = context ? `${question}\n\nContext:\n${context}` : question;
@@ -1760,13 +1768,13 @@ async function askViaDialogs(
          "Type your selection(s)...",
          dialogOpts,
       ) as string | undefined;
-      if (isCancelledInput(rawSelections)) return null;
+      if (!isPending() || isCancelledInput(rawSelections)) return complete(null);
 
       const selections = parseDialogSelections(rawSelections);
-      if (selections.length === 0) return null;
+      if (selections.length === 0) return complete(null);
 
       if (!allowComment) {
-         return createSelectionResponse(selections);
+         return complete(createSelectionResponse(selections));
       }
 
       const comment = await ui.input(
@@ -1774,23 +1782,23 @@ async function askViaDialogs(
          "Optional comment (press Enter to skip)...",
          dialogOpts,
       ) as string | undefined;
-      return createSelectionResponse(selections, comment);
+      return complete(createSelectionResponse(selections, comment));
    }
 
    const selectOptions = options.map((o) => o.title);
    if (allowFreeform) selectOptions.push(FREEFORM_SENTINEL);
 
    const selected = await ui.select(prompt, selectOptions, dialogOpts) as string | undefined;
-   if (isCancelledInput(selected)) return null;
+   if (!isPending() || isCancelledInput(selected)) return complete(null);
 
    if (selected === FREEFORM_SENTINEL) {
       const answer = await ui.input(prompt, "Type your answer...", dialogOpts) as string | undefined;
-      if (isCancelledInput(answer)) return null;
-      return createFreeformResponse(answer);
+      if (isCancelledInput(answer)) return complete(null);
+      return complete(createFreeformResponse(answer));
    }
 
    if (!allowComment) {
-      return createSelectionResponse([selected]);
+      return complete(createSelectionResponse([selected]));
    }
 
    const comment = await ui.input(
@@ -1798,10 +1806,14 @@ async function askViaDialogs(
       "Optional comment (press Enter to skip)...",
       dialogOpts,
    ) as string | undefined;
-   return createSelectionResponse([selected], comment);
+   return complete(createSelectionResponse([selected], comment));
 }
 
 export default function(pi: ExtensionAPI) {
+   const deferral = new CooperativeDefer(pi.events);
+   deferral.start();
+   pi.on("session_start", () => deferral.start());
+   pi.on("session_shutdown", () => deferral.shutdown());
    pi.registerTool({
       name: "ask_user",
       label: "Ask User",
@@ -1873,7 +1885,7 @@ export default function(pi: ExtensionAPI) {
          ),
       }),
 
-      async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
          if (signal?.aborted) {
             return {
                content: [{ type: "text", text: "Cancelled" }],
@@ -1945,130 +1957,109 @@ export default function(pi: ExtensionAPI) {
             };
          }
 
-         if (options.length === 0) {
-            const prompt = normalizedContext ? `${question}\n\nContext:\n${normalizedContext}` : question;
-            const answer = await ctx.ui.input(prompt, "Type your answer...", timeout ? { timeout } : undefined);
-            const response = createFreeformResponse(answer);
-
-            if (!response) {
-               return {
-                  content: [{ type: "text", text: "User cancelled the question" }],
-                  details: { question, context: normalizedContext, options, response: null, cancelled: true } as AskToolDetails,
-               };
-            }
-
-            pi.events.emit("ask:answered", { question, context: normalizedContext, response });
-            return {
-               content: [{ type: "text", text: `User answered: ${formatResponseSummary(response)}` }],
-               details: { question, context: normalizedContext, options, response, cancelled: false } as AskToolDetails,
-            };
-         }
-
-         onUpdate?.({
-            content: [{ type: "text", text: "Waiting for user input..." }],
-            details: { question, context: normalizedContext, options, response: null, cancelled: false },
-         });
-
-         let result: AskUIResult | null;
+         const call = deferral.create<AskUIResult>(toolCallId);
+         const ids = call.ids;
+         const owner = call.owner;
+         const attribution = ctx.mode === "tui" && (ctx.ui as { uiPromptOwnership?: unknown }).uiPromptOwnership === "exclusive-v1";
+         const controller = new AbortController();
+         const marker = (ctx.ui as { targetedDialogCancellation?: readonly DialogKind[] }).targetedDialogCancellation;
+         const supports = (kind: DialogKind) => ctx.mode === "tui" && marker?.includes(kind) === true;
+         const onAbort = () => queueMicrotask(() => call.cancel());
+         signal?.addEventListener("abort", onAbort, { once: true });
+         let timer: ReturnType<typeof setTimeout> | undefined;
          let overlayHandle: OverlayHandle | undefined;
          let removeOverlayInputListener: (() => void) | undefined;
          let hasAnnouncedHide = false;
+         const dialogs = {
+            input: (title: string, placeholder?: string, opts?: { timeout?: number }) => {
+               call.wire("input", supports("input"), () => controller.abort(), attribution);
+               const dialogOptions = { ...opts, signal: controller.signal, owner };
+               return ctx.ui.input(title, placeholder, dialogOptions);
+            },
+            select: (title: string, values: string[], opts?: { timeout?: number }) => {
+               call.wire("select", supports("select"), () => controller.abort(), attribution);
+               const dialogOptions = { ...opts, signal: controller.signal, owner };
+               return ctx.ui.select(title, values, dialogOptions);
+            },
+         };
+         let result: AskUIResult | null = null;
          try {
-            const customFactory = (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (result: AskUIResult | null) => void) => {
-               if (signal) {
-                  const onAbort = () => done(null);
-                  signal.addEventListener("abort", onAbort, { once: true });
-               }
-
-               if (timeout && timeout > 0) {
-                  setTimeout(() => done(null), timeout);
-               }
-
-               return new AskComponent(
-                  question,
-                  normalizedContext,
-                  options,
-                  allowMultiple,
-                  allowFreeform,
-                  allowComment,
-                  effectiveDisplayMode,
-                  tui,
-                  theme,
-                  keybindings,
-                  shortcuts,
-                  done,
-               );
-            };
-
-            // Register a raw terminal input listener for the overlay-toggle key so the
-            // overlay can be toggled even while it is hidden (hidden overlays do not
-            // receive input). Inline mode does not need this because the prompt is
-            // already non-modal. Skipped entirely if the user disabled the shortcut.
-            const overlayToggle = shortcuts.overlayToggle;
-            if (
-               effectiveDisplayMode === "overlay"
-               && !overlayToggle.disabled
-               && typeof ctx.ui.onTerminalInput === "function"
-            ) {
-               removeOverlayInputListener = ctx.ui.onTerminalInput((data) => {
-                  if (!overlayToggle.matches(data) || !overlayHandle) return undefined;
-                  const nextHidden = !overlayHandle.isHidden();
-                  overlayHandle.setHidden(nextHidden);
-                  if (nextHidden && !hasAnnouncedHide) {
-                     hasAnnouncedHide = true;
-                     ctx.ui.notify?.(`ask_user hidden — press ${overlayToggle.spec} to reopen`, "info");
-                  }
-                  return { consume: true };
-               });
-            }
-
-            const customResult = await ctx.ui.custom<AskUIResult | null>(
-               customFactory,
-               buildCustomUIOptions(effectiveDisplayMode, (handle) => {
-                  overlayHandle = handle;
-               }),
-            );
-
-            if (customResult !== undefined) {
-               result = customResult;
+            if (options.length === 0) {
+               const prompt = normalizedContext ? `${question}\n\nContext:\n${normalizedContext}` : question;
+               result = await dialogs.input(prompt, "Type your answer...", timeout ? { timeout } : undefined)
+                  .then((answer) => call.complete(createFreeformResponse(answer)));
             } else {
-               // RPC/headless mode: degrade to select()/input() dialog protocol
-               result = await askViaDialogs(ctx.ui, question, normalizedContext, options, allowMultiple, allowFreeform, allowComment, timeout);
+               onUpdate?.({
+                  content: [{ type: "text", text: "Waiting for user input..." }],
+                  details: { question, context: normalizedContext, options, response: null, cancelled: false, ...ids },
+               });
+               const customFactory = (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (result: AskUIResult | null) => void) => {
+                  const kind = effectiveDisplayMode === "overlay" ? "custom-overlay" : "custom-inline";
+                  call.wire(kind, supports(kind), () => done(null), attribution);
+                  return new AskComponent(
+                     question, normalizedContext, options, allowMultiple, allowFreeform, allowComment,
+                     effectiveDisplayMode, tui, theme, keybindings, shortcuts,
+                     (response) => {
+                        if (call.outcome !== "pending") return;
+                        call.complete(response);
+                        done(response);
+                     },
+                  );
+               };
+               const overlayToggle = shortcuts.overlayToggle;
+               if (effectiveDisplayMode === "overlay" && !overlayToggle.disabled && typeof ctx.ui.onTerminalInput === "function") {
+                  removeOverlayInputListener = ctx.ui.onTerminalInput((data) => {
+                     if (!overlayToggle.matches(data) || !overlayHandle) return undefined;
+                     const nextHidden = !overlayHandle.isHidden();
+                     overlayHandle.setHidden(nextHidden);
+                     if (nextHidden && !hasAnnouncedHide) {
+                        hasAnnouncedHide = true;
+                        ctx.ui.notify?.(`ask_user hidden — press ${overlayToggle.spec} to reopen`, "info");
+                     }
+                     return { consume: true };
+                  });
+               }
+               if (timeout && timeout > 0) timer = setTimeout(() => call.cancel(), timeout);
+               const customOptions = { ...buildCustomUIOptions(effectiveDisplayMode, (handle) => { overlayHandle = handle; }), owner };
+               const customResult = await ctx.ui.custom<AskUIResult | null>(customFactory, customOptions);
+               clearTimeout(timer);
+               if (customResult !== undefined) {
+                  result = call.complete(customResult);
+               } else if (call.outcome === "pending") {
+                  result = await askViaDialogs(dialogs, question, normalizedContext, options, allowMultiple, allowFreeform,
+                     allowComment, timeout, (response) => call.complete(response), () => call.outcome === "pending");
+               }
             }
          } catch (error) {
-            const message =
-               error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
-            return {
-               content: [{ type: "text", text: `Ask tool failed: ${message}` }],
-               isError: true,
-               details: { error: message },
-            };
+            call.fail();
+            const message = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+            return { content: [{ type: "text", text: `Ask tool failed: ${message}` }], isError: true, details: { error: message, ...ids } };
          } finally {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
             removeOverlayInputListener?.();
+            deferral.finish(call);
          }
-
+         if (call.outcome === "deferred") {
+            pi.events.emit("ask:deferred", { question, context: normalizedContext, options, ...ids, reason: "deferred_by_afk" });
+            return {
+               content: [{ type: "text", text: DEFER_TEXT }],
+               details: { question, context: normalizedContext, options, response: null, cancelled: true,
+                  status: "no_human_answer", reason: "deferred_by_afk", ...ids } as AskToolDetails,
+            };
+         }
          if (result === null) {
-            pi.events.emit("ask:cancelled", { question, context: normalizedContext, options });
+            // Preserve the ordinary freeform cancellation event behavior.
+            if (options.length > 0) pi.events.emit("ask:cancelled", { question, context: normalizedContext, options, ...ids });
             return {
                content: [{ type: "text", text: "User cancelled the question" }],
-               details: { question, context: normalizedContext, options, response: null, cancelled: true } as AskToolDetails,
+               details: { question, context: normalizedContext, options, response: null, cancelled: true, ...ids } as AskToolDetails,
             };
          }
-
-         pi.events.emit("ask:answered", {
-            question,
-            context: normalizedContext,
-            response: result,
-         });
+         pi.events.emit("ask:answered", { question, context: normalizedContext, response: result, ...ids });
          return {
             content: [{ type: "text", text: `User answered: ${formatResponseSummary(result)}` }],
-            details: {
-               question,
-               context: normalizedContext,
-               options,
-               response: result,
-               cancelled: false,
-            } as AskToolDetails,
+            details: { question, context: normalizedContext, options, response: result, cancelled: false, ...ids } as AskToolDetails,
          };
       },
 
@@ -2103,6 +2094,10 @@ export default function(pi: ExtensionAPI) {
                .join("\n")
                .trim() || "Waiting for user input...";
             return new Text(theme.fg("muted", waitingText), 0, 0);
+         }
+
+         if (details?.reason === "deferred_by_afk") {
+            return new Text(theme.fg("warning", "Deferred (AFK) — no completed human answer"), 0, 0);
          }
 
          if (!details || details.cancelled || !details.response) {
