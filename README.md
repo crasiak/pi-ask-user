@@ -1,3 +1,5 @@
+> **Personal fork — not intended for public consumption.** This is a personal working copy of [edlsh/pi-ask-user](https://github.com/edlsh/pi-ask-user), kept for experiments. It is unmaintained and unsupported, may diverge from upstream or be rewritten at any time, and nothing here is released for others to use. Use the upstream project instead.
+
 # pi-ask-user
 
 A Pi package that adds an interactive `ask_user` tool for collecting user decisions during an agent run.
